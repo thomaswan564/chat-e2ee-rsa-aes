@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>安全聊天 - RSA + AES E2EE</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<style>
+    body {
+        font-family: Arial, sans-serif;
+        background: #f2f2f2;
+        margin: 0;
+        padding: 0;
+    }
+    #container {
+        max-width: 600px;
+        margin: auto;
+        margin-top: 20px;
+        background: white;
+        box-shadow: 0 0 10px rgba(0,0,0,0.1);
+        border-radius: 8px;
+        padding: 20px;
+    }
+    #chat-box {
+        width: 100%;
+        height: 400px;
+        overflow-y: scroll;
+        background: #fafafa;
+        padding: 10px;
+        border-radius: 6px;
+        border: 1px solid #ddd;
+    }
+    .msg {
+        padding: 8px 12px;
+        margin: 8px 0;
+        border-radius: 6px;
+        max-width: 80%;
+        word-break: break-word;
+    }
+    .me {
+        background: #d1ffd1;
+        text-align: right;
+        margin-left: auto;
+    }
+    .other {
+        background: #e6e6ff;
+        margin-right: auto;
+    }
+    #input-area {
+        margin-top: 15px;
+        display: flex;
+        gap: 10px;
+    }
+    #msg {
+        flex: 1;
+        padding: 10px;
+        border-radius: 6px;
+        border: 1px solid #ccc;
+    }
+    #send {
+        padding: 10px 20px;
+        border: none;
+        background: #4CAF50;
+        color: white;
+        cursor: pointer;
+        border-radius: 6px;
+    }
+    #send:hover {
+        background: #45a049;
+    }
+    #status {
+        margin-top: 10px;
+        color: gray;
+        font-size: 14px;
+    }
+</style>
+</head>
+<body>
+
+<div id="container">
+    <h2>🔐 安全聊天（RSA + AES 混合加密）</h2>
+
+    <div id="status">初始化中…</div>
+
+    <div id="chat-box"></div>
+
+    <div id="input-area">
+        <input type="text" id="msg" placeholder="输入消息…">
+        <button id="send">发送</button>
+    </div>
+</div>
+
+<script src="crypto.js"></script>
+
+<script>
+/*
+    全局变量
+*/
+let myId = localStorage.getItem("client_id") || crypto.randomUUID();
+localStorage.setItem("client_id", myId);
+
+let RSAKeyPair = null;
+let peerPublicKey = null;
+
+let lastTimestamp = 0; // 拉取消息用
+
+const statusDiv = document.getElementById("status");
+const chatBox = document.getElementById("chat-box");
+
+// 显示消息
+function addMessage(text, isMe) {
+    const div = document.createElement("div");
+    div.className = "msg " + (isMe ? "me" : "other");
+    div.textContent = text;
+    chatBox.appendChild(div);
+    chatBox.scrollTop = chatBox.scrollHeight;
+}
+
+/*
+    初始化 RSA 密钥
+*/
+async function initRSA() {
+    statusDiv.innerText = "生成 RSA 密钥…";
+
+    RSAKeyPair = await generateRSAKey();
+
+    const publicKeyBase64 = await exportPublicKey(RSAKeyPair.publicKey);
+
+    statusDiv.innerText = "上传公钥…";
+
+    await fetch("/api/register", {
+        method: "POST",
+        body: JSON.stringify({
+            id: myId,
+            publicKey: publicKeyBase64
+        })
+    });
+
+    statusDiv.innerText = "已上线（ID: " + myId + "）";
+}
+
+/*
+    发送消息
+*/
+document.getElementById("send").onclick = async function() {
+    if (!peerPublicKey) {
+        alert("还没有获取对方公钥！");
+        return;
+    }
+
+    const text = document.getElementById("msg").value.trim();
+    if (text === "") return;
+
+    document.getElementById("msg").value = "";
+
+    // 1. 生成 AES 密钥
+    const aesKey = await generateAESKey();
+
+    // 2. 用 AES 加密消息
+    const encryptedMsg = await aesEncrypt(text, aesKey);
+
+    // 3. 导出 AES 密钥并用 RSA 公钥加密
+    const rawAES = await exportAESKey(aesKey);
+    const encryptedAESKey = await rsaEncrypt(rawAES, peerPublicKey);
+
+    // 4. 发送到服务器
+    await fetch("/api/send", {
+        method: "POST",
+        body: JSON.stringify({
+            from: myId,
+            to: "target", // 你可以改成真正的目标 id
+            aesKey: btoa(encryptedAESKey),
+            data: btoa(encryptedMsg)
+        })
+    });
+
+    addMessage(text, true);
+};
+
+/*
+    获取对方公钥
+*/
+async function loadPeerKey() {
+    const res = await fetch("/api/getkey?user=target");
+    const data = await res.json();
+
+    if (!data.publicKey) return;
+
+    peerPublicKey = await importPublicKey(data.publicKey);
+    console.log("已加载对方公钥");
+}
+
+/*
+    每隔 2 秒读取消息
+*/
+async function pollMessages() {
+    const res = await fetch("/api/recv?id=" + myId + "&since=" + lastTimestamp);
+    const arr = await res.json();
+
+    for (let msg of arr) {
+        lastTimestamp = msg.timestamp;
+
+        // 解密 AES 密钥
+        const encryptedAESKey = Uint8Array.from(atob(msg.aesKey), c => c.charCodeAt(0));
+        const rawAESKey = await rsaDecrypt(encryptedAESKey, RSAKeyPair.privateKey);
+
+        const aesKey = await importAESKey(rawAESKey);
+
+        // 解密内容
+        const encryptedMsg = Uint8Array.from(atob(msg.data), c => c.charCodeAt(0));
+        const decrypted = await aesDecrypt(encryptedMsg, aesKey);
+
+        addMessage(decrypted, false);
+    }
+
+    setTimeout(pollMessages, 2000);
+}
+
+/*
+    启动流程
+*/
+(async() => {
+    await initRSA();
+    await loadPeerKey();
+    pollMessages();
+})();
+</script>
+
+</body>
+</html>
